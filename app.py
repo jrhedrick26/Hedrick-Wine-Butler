@@ -8,43 +8,45 @@ from PIL import Image
 
 # --- 1. THE BUTLER'S REPAIR KIT ---
 def get_cleaned_connection():
-    """
-    Manually extracts secrets, fixes the PEM formatting, 
-    and returns a clean GSheets connection.
-    """
-    # 1. Get the gsheets secrets into a dictionary we can edit
-    # st.secrets is usually read-only, so we convert to a dict
+    # 1. Get the gsheets secrets into a dictionary
     gs_creds = st.secrets["connections"]["gsheets"].to_dict()
     
     # 2. Fix the PEM formatting (\n issues)
     if "private_key" in gs_creds:
         gs_creds["private_key"] = gs_creds["private_key"].replace("\\n", "\n")
     
-    # 3. CRITICAL: Remove 'type' from the dictionary to avoid the 'multiple values' error
-    # Because we pass type=GSheetsConnection explicitly in the function call.
-    if "type" in gs_creds:
-        del gs_creds["type"]
+    # 3. List of keys that Google Service Accounts actually want
+    # We remove 'spreadsheet' and 'type' because they aren't part of the 
+    # official Google credential format and cause errors in st.connection
+    valid_keys = [
+        "project_id", "private_key_id", "private_key", 
+        "client_email", "client_id", "auth_uri", "token_uri", 
+        "auth_provider_x509_cert_url", "client_x509_cert_url"
+    ]
+    
+    # Create a clean dictionary with ONLY the valid keys
+    clean_creds = {k: gs_creds[k] for k in valid_keys if k in gs_creds}
         
-    # 4. Initialize connection with the fixed credentials
-    return st.connection("gsheets", type=GSheetsConnection, **gs_creds)
+    # 4. Initialize connection with ONLY the clean service account credentials
+    return st.connection("gsheets", type=GSheetsConnection, **clean_creds)
 
 # --- 2. CONFIG ---
 st.set_page_config(page_title="Hedrick Wine Butler", page_icon="🍷")
+SHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 
 # --- 3. CONNECTIONS ---
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-# Using gemini-1.5-flash for maximum stability on Streamlit Cloud
 model = genai.GenerativeModel("gemini-1.5-flash")
 
 try:
     conn = get_cleaned_connection()
 except Exception as e:
     st.error(f"⚠️ Butler Connection Error: {e}")
-    st.stop() # Stop the app if we can't connect
+    st.stop()
 
 # --- 4. UI ---
 st.title("🍷 Hedrick Wine Butler")
-st.markdown("### *At your service for the Hedrick Cellar.*")
+st.markdown("### *Your cellar assistant is ready.*")
 
 cam = st.camera_input("📸 Scan Label")
 upload = st.file_uploader("📂 Or Upload", type=['jpg','png','jpeg'])
@@ -58,23 +60,14 @@ if st.button("Consult the Butler", type="primary"):
         with st.spinner("The Butler is examining the vintage..."):
             try:
                 img = Image.open(img_file)
-                
-                # Instruction for strict JSON
-                prompt = """
-                Analyze this wine label. Return ONLY a JSON object: 
-                {"winery": str, "wine_name": str, "vintage": str, "varietal": str, "region": str, "butler_comment": str}
-                Be sophisticated and witty in the butler_comment.
-                """
+                prompt = 'Return ONLY a JSON object: {"winery": str, "wine_name": str, "vintage": str, "varietal": str, "region": str, "butler_comment": str}'
                 
                 response = model.generate_content([prompt, img])
-                
-                # Clean JSON response from Gemini
                 clean_text = response.text.replace('```json', '').replace('```', '').strip()
                 data = json.loads(clean_text)
                 
                 # --- 5. DISPLAY RESULTS ---
                 st.subheader(f"{data.get('winery')} - {data.get('wine_name')}")
-                st.markdown(f"**Vintage:** {data.get('vintage')} | **Region:** {data.get('region')}")
                 st.info(data.get('butler_comment'))
                 
                 # --- 6. SAVE TO SHEET ---
@@ -86,17 +79,18 @@ if st.button("Consult the Butler", type="primary"):
                     "Comment": data.get('butler_comment')
                 }])
                 
-                # Use ttl=0 to get fresh data, then update
-                df = conn.read(ttl=0)
+                # We pass the SHEET_URL directly here to avoid the connection error
+                df = conn.read(spreadsheet=SHEET_URL, ttl=0)
                 updated_df = pd.concat([df, new_row], ignore_index=True)
-                conn.update(data=updated_df)
+                
+                conn.update(spreadsheet=SHEET_URL, data=updated_df)
                 
                 st.success("Entry saved to the Hedrick Cellar Book!")
                 st.toast("Cellar updated.", icon="🍷")
                 
             except Exception as e:
-                st.error(f"The Butler encountered an error during analysis: {e}")
+                st.error(f"The Butler encountered an error: {e}")
     else:
-        st.warning("Please provide an image for the Butler's inspection.")
+        st.warning("Please provide an image.")
 
-st.caption("Hedrick Wine Butler v1.1 | Powered by Gemini")
+st.caption("Hedrick Wine Butler v1.2")
