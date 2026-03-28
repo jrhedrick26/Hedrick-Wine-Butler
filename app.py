@@ -6,40 +6,51 @@ import json
 from datetime import datetime
 from PIL import Image
 
-# --- 1. THE BUTLER'S REPAIR KIT (Fixes the PEM Error) ---
-def fix_private_key(key):
-    # This converts literal "\n" text into actual line breaks
-    return key.replace("\\n", "\n")
+# --- 1. THE BUTLER'S REPAIR KIT ---
+def get_cleaned_connection():
+    """
+    Manually extracts secrets, fixes the PEM formatting, 
+    and returns a clean GSheets connection.
+    """
+    # 1. Get the gsheets secrets into a dictionary we can edit
+    # st.secrets is usually read-only, so we convert to a dict
+    gs_creds = st.secrets["connections"]["gsheets"].to_dict()
+    
+    # 2. Fix the PEM formatting (\n issues)
+    if "private_key" in gs_creds:
+        gs_creds["private_key"] = gs_creds["private_key"].replace("\\n", "\n")
+    
+    # 3. CRITICAL: Remove 'type' from the dictionary to avoid the 'multiple values' error
+    # Because we pass type=GSheetsConnection explicitly in the function call.
+    if "type" in gs_creds:
+        del gs_creds["type"]
+        
+    # 4. Initialize connection with the fixed credentials
+    return st.connection("gsheets", type=GSheetsConnection, **gs_creds)
 
 # --- 2. CONFIG ---
 st.set_page_config(page_title="Hedrick Wine Butler", page_icon="🍷")
 
 # --- 3. CONNECTIONS ---
-# Initialize Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# Using gemini-1.5-flash for maximum stability on Streamlit Cloud
 model = genai.GenerativeModel("gemini-1.5-flash")
 
-# Initialize GSheets with Self-Healing Secrets
 try:
-    # Create a copy of secrets to modify for the connection
-    secrets_dict = st.secrets.to_dict()
-    # Apply the fix to the private_key
-    raw_key = secrets_dict["connections"]["gsheets"]["private_key"]
-    secrets_dict["connections"]["gsheets"]["private_key"] = fix_private_key(raw_key)
-    
-    # Connect using the fixed credentials
-    conn = st.connection("gsheets", type=GSheetsConnection, **secrets_dict["connections"]["gsheets"])
+    conn = get_cleaned_connection()
 except Exception as e:
     st.error(f"⚠️ Butler Connection Error: {e}")
+    st.stop() # Stop the app if we can't connect
 
 # --- 4. UI ---
 st.title("🍷 Hedrick Wine Butler")
-st.write("Take a photo of a wine label and I shall record it for you.")
+st.markdown("### *At your service for the Hedrick Cellar.*")
 
-cam = st.camera_input("Scan Label")
-upload = st.file_uploader("Or Upload", type=['jpg','png','jpeg'])
+cam = st.camera_input("📸 Scan Label")
+upload = st.file_uploader("📂 Or Upload", type=['jpg','png','jpeg'])
 img_file = cam if cam else upload
 
+st.write("---")
 rating = st.feedback("stars")
 
 if st.button("Consult the Butler", type="primary"):
@@ -47,19 +58,26 @@ if st.button("Consult the Butler", type="primary"):
         with st.spinner("The Butler is examining the vintage..."):
             try:
                 img = Image.open(img_file)
-                prompt = "Return ONLY a JSON object: winery, wine_name, vintage, varietal, region, butler_comment. Be sophisticated."
+                
+                # Instruction for strict JSON
+                prompt = """
+                Analyze this wine label. Return ONLY a JSON object: 
+                {"winery": str, "wine_name": str, "vintage": str, "varietal": str, "region": str, "butler_comment": str}
+                Be sophisticated and witty in the butler_comment.
+                """
                 
                 response = model.generate_content([prompt, img])
                 
-                # Clean JSON response
+                # Clean JSON response from Gemini
                 clean_text = response.text.replace('```json', '').replace('```', '').strip()
                 data = json.loads(clean_text)
                 
-                # Display Results
+                # --- 5. DISPLAY RESULTS ---
                 st.subheader(f"{data.get('winery')} - {data.get('wine_name')}")
-                st.markdown(data.get('butler_comment'))
+                st.markdown(f"**Vintage:** {data.get('vintage')} | **Region:** {data.get('region')}")
+                st.info(data.get('butler_comment'))
                 
-                # Save to Sheet
+                # --- 6. SAVE TO SHEET ---
                 new_row = pd.DataFrame([{
                     "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "Winery": data.get('winery'),
@@ -68,13 +86,17 @@ if st.button("Consult the Butler", type="primary"):
                     "Comment": data.get('butler_comment')
                 }])
                 
-                # Read, Append, Update
-                df = conn.read()
+                # Use ttl=0 to get fresh data, then update
+                df = conn.read(ttl=0)
                 updated_df = pd.concat([df, new_row], ignore_index=True)
                 conn.update(data=updated_df)
+                
                 st.success("Entry saved to the Hedrick Cellar Book!")
+                st.toast("Cellar updated.", icon="🍷")
                 
             except Exception as e:
                 st.error(f"The Butler encountered an error during analysis: {e}")
     else:
-        st.warning("Please provide an image.")
+        st.warning("Please provide an image for the Butler's inspection.")
+
+st.caption("Hedrick Wine Butler v1.1 | Powered by Gemini")
