@@ -6,83 +6,65 @@ import json
 from datetime import datetime
 from PIL import Image
 
-# --- 1. THE BUTLER'S REPAIR KIT ---
-def get_cleaned_connection():
-    """
-    Fixes the PEM formatting and passes credentials in the 
-    one format the GSheets library actually accepts.
-    """
-    # Get the secrets
-    gs_creds = st.secrets["connections"]["gsheets"].to_dict()
-    
-    # Fix the PEM formatting (replaces text '\n' with real newlines)
-    if "private_key" in gs_creds:
-        gs_creds["private_key"] = gs_creds["private_key"].replace("\\n", "\n")
-    
-    # Create the service_account_info dictionary
-    # This is the standard format Google expects
-    service_account_info = {
-        "type": gs_creds.get("type", "service_account"),
-        "project_id": gs_creds.get("project_id"),
-        "private_key_id": gs_creds.get("private_key_id"),
-        "private_key": gs_creds.get("private_key"),
-        "client_email": gs_creds.get("client_email"),
-        "client_id": gs_creds.get("client_id"),
-        "auth_uri": gs_creds.get("auth_uri"),
-        "token_uri": gs_creds.get("token_uri"),
-        "auth_provider_x509_cert_url": gs_creds.get("auth_provider_x509_cert_url"),
-        "client_x509_cert_url": gs_creds.get("client_x509_cert_url"),
-    }
-        
-    # Pass it as ONE single argument called service_account_info
-    return st.connection("gsheets", type=GSheetsConnection, service_account_info=service_account_info)
-
-# --- 2. CONFIG ---
+# --- 1. CONFIG ---
 st.set_page_config(page_title="Hedrick Wine Butler", page_icon="🍷")
-SHEET_URL = st.secrets["connections"]["gsheets"]["spreadsheet"]
 
-# --- 3. CONNECTIONS ---
+# --- 2. CONNECTIONS ---
+# Initialize Gemini
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 model = genai.GenerativeModel("gemini-1.5-flash")
 
+# Initialize GSheets
+# We call it simply. The library will look for [connections.gsheets] in secrets.
 try:
-    conn = get_cleaned_connection()
+    conn = st.connection("gsheets", type=GSheetsConnection)
 except Exception as e:
-    st.error(f"⚠️ Butler Connection Error: {e}")
-    st.stop()
+    st.error(f"The Butler can't find the cellar book: {e}")
 
-# --- 4. UI ---
+# --- 3. UI ---
 st.title("🍷 Hedrick Wine Butler")
-st.markdown("### *Your cellar assistant is ready.*")
+st.markdown("### *At your service for the Hedrick Cellar.*")
 
 cam = st.camera_input("📸 Scan Label")
-upload = st.file_uploader("📂 Or Upload", type=['jpg','png','jpeg'])
+upload = st.file_uploader("📂 Or Upload", type=['jpg', 'png', 'jpeg'])
 img_file = cam if cam else upload
 
 st.write("---")
+# User feedback returns 0-4 stars, we add 1 to make it 1-5
 rating = st.feedback("stars")
 
 if st.button("Consult the Butler", type="primary"):
     if img_file:
         with st.spinner("The Butler is examining the vintage..."):
             try:
+                # Process Image
                 img = Image.open(img_file)
-                # We tell Gemini to use the exact names of your Sheet columns
+                
+                # Holistic Prompting: Clearer instructions for Gemini
                 prompt = """
-                Analyze this wine label. Return ONLY a JSON object: 
-                {"Winery": str, "Wine_Name": str, "Vintage": str, "Varietal": str, "Region": str, "Butler_Comment": str}
-                Be sophisticated and witty in the Butler_Comment.
+                Identify this wine. Return ONLY a JSON object with these keys:
+                "Winery", "Wine_Name", "Vintage", "Varietal", "Region", "Butler_Comment"
+                The Butler_Comment should be sophisticated, witty, and mention a food pairing.
                 """
                 
                 response = model.generate_content([prompt, img])
-                clean_text = response.text.replace('```json', '').replace('```', '').strip()
-                data = json.loads(clean_text)
                 
-                # --- 5. DISPLAY RESULTS ---
+                # Holistic JSON Cleaning: Removes markdown backticks if Gemini adds them
+                raw_text = response.text
+                if "```json" in raw_text:
+                    raw_text = raw_text.split("```json")[1].split("```")[0]
+                elif "```" in raw_text:
+                    raw_text = raw_text.split("```")[1].split("```")[0]
+                
+                data = json.loads(raw_text.strip())
+                
+                # --- 4. DISPLAY RESULTS ---
                 st.subheader(f"{data.get('Winery')} - {data.get('Wine_Name')}")
+                st.markdown(f"**Vintage:** {data.get('Vintage')} | **Region:** {data.get('Region')}")
                 st.info(data.get('Butler_Comment'))
                 
-                # --- 6. SAVE TO SHEET ---
+                # --- 5. SAVE TO SHEET ---
+                # We create the row using the exact column names from your screenshot
                 new_row = pd.DataFrame([{
                     "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "Winery": data.get('Winery'),
@@ -90,21 +72,23 @@ if st.button("Consult the Butler", type="primary"):
                     "Vintage": data.get('Vintage'),
                     "Varietal": data.get('Varietal'),
                     "Region": data.get('Region'),
-                    "User_Rating": rating + 1 if rating is not None else 0,
+                    "User_Rating": (rating + 1) if rating is not None else 0,
                     "Butler_Comment": data.get('Butler_Comment')
                 }])
                 
-                # Use the SHEET_URL to read and update
-                df = conn.read(spreadsheet=SHEET_URL, ttl=0)
-                updated_df = pd.concat([df, new_row], ignore_index=True)
-                conn.update(spreadsheet=SHEET_URL, data=updated_df)
+                # Read existing data (ttl=0 ensures we don't get a cached version)
+                existing_df = conn.read(ttl=0)
                 
-                st.success("Entry saved to the Hedrick Cellar Book!")
+                # Combine and Update
+                updated_df = pd.concat([existing_df, new_row], ignore_index=True)
+                conn.update(data=updated_df)
+                
+                st.success("The Butler has recorded this in your Cellar Book!")
                 st.toast("Cellar updated.", icon="🍷")
                 
             except Exception as e:
-                st.error(f"The Butler encountered an error: {e}")
+                st.error(f"The Butler encountered an issue: {e}")
     else:
-        st.warning("Please provide an image.")
+        st.warning("Please provide a label for the Butler to inspect.")
 
-st.caption("Hedrick Wine Butler v1.3")
+st.caption("Hedrick Wine Butler | v1.4")
